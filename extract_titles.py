@@ -1,5 +1,7 @@
 from bs4 import BeautifulSoup
 import os
+from openpyxl import Workbook
+from datetime import datetime
 
 def extract_titles_from_html(html_file_path):
     """
@@ -109,15 +111,6 @@ def extract_titles_from_html(html_file_path):
         print(f"Total de títulos encontrados: {len(titles)}")
         print(f"{'='*60}\n")
         
-        # Imprimir todos los títulos
-        if titles:
-            print("LISTA COMPLETA DE TÍTULOS:")
-            print("-" * 60)
-            for i, title in enumerate(titles, 1):
-                print(f"{i}. {title}")
-        else:
-            print("No se encontraron títulos.")
-        
         return titles
         
     except FileNotFoundError:
@@ -128,6 +121,42 @@ def extract_titles_from_html(html_file_path):
         import traceback
         traceback.print_exc()
         return []
+
+def save_titles_to_excel(titles, output_file="títulos.xlsx"):
+    """
+    Guarda la lista de títulos en un archivo Excel.
+    Crea una hoja llamada 'Títulos' y coloca los títulos en la columna A.
+    """
+    try:
+        # Crear un nuevo workbook
+        wb = Workbook()
+        
+        # Seleccionar la hoja activa (primera hoja)
+        ws = wb.active
+        ws.title = "Títulos"
+        
+        # Agregar encabezado
+        ws['A1'] = "Título"
+        ws['A1'].font = ws['A1'].font.copy(bold=True)
+        
+        # Agregar los títulos a partir de la fila 2
+        for idx, title in enumerate(titles, start=2):
+            ws[f'A{idx}'] = title
+        
+        # Ajustar el ancho de la columna A para que se vea mejor
+        ws.column_dimensions['A'].width = 100
+        
+        # Guardar el archivo
+        wb.save(output_file)
+        print(f"[OK] Archivo Excel creado exitosamente: {output_file}")
+        print(f"Total de títulos guardados: {len(titles)}")
+        return True
+        
+    except Exception as e:
+        print(f"[ERROR] Error al crear el archivo Excel: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 if __name__ == "__main__":
     # Lista de archivos HTML a probar en orden de prioridad
@@ -156,3 +185,12 @@ if __name__ == "__main__":
     
     # Extraer los títulos
     titles = extract_titles_from_html(html_file)
+    
+    # Guardar los títulos en un archivo Excel
+    if titles:
+        # Generar nombre de archivo con timestamp para evitar sobrescribir
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        excel_filename = f"títulos_{timestamp}.xlsx"
+        save_titles_to_excel(titles, excel_filename)
+    else:
+        print("\n[INFO] No se encontraron títulos para guardar en Excel.")
