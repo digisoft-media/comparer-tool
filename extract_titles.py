@@ -1,354 +1,393 @@
-from bs4 import BeautifulSoup
+import argparse
 import os
-from openpyxl import Workbook
+import re
+import sys
+import time
 from datetime import datetime
+from typing import List, Dict, Optional
 
-def extract_table_data(command_result_with_table):
-    """
-    Extrae los datos de la tabla dentro de un div CommandResult con tabla.
-    Retorna una lista de diccionarios con los datos de la tabla.
-    """
-    table_data = []
-    
-    try:
-        # Buscar la tabla con data-testid="datagrid.table"
-        datagrid_table = command_result_with_table.find('div', {'data-testid': 'datagrid.table'})
-        if not datagrid_table:
-            # Intentar buscar por role="table"
-            datagrid_table = command_result_with_table.find('div', {'role': 'table'})
-        
-        if not datagrid_table:
-            return table_data
-        
-        # Buscar los encabezados de las columnas
-        headers = []
-        column_headers = datagrid_table.find_all('div', {'role': 'columnheader'})
-        for header in column_headers:
-            # Intentar obtener el nombre de la columna desde aria-label o data-cell-id
-            aria_label = header.get('aria-label', '')
-            cell_id = header.get('data-cell-id', '')
-            
-            # Buscar el texto del encabezado
-            header_text = header.find('span', class_=lambda x: x and 'dg--header-text' in x)
-            if header_text:
-                header_name = header_text.get_text(strip=True)
-            elif aria_label:
-                header_name = aria_label
-            elif cell_id:
-                header_name = cell_id
-            else:
-                continue
-            
-            # Solo incluir las columnas que nos interesan (account, Avg Sales, Number of IDs)
-            if header_name and header_name not in ['#row_number#']:
-                headers.append(header_name)
-        
-        # Si no encontramos encabezados por los métodos anteriores, buscar directamente en los spans
-        if not headers:
-            # Buscar todos los headers por el texto
-            header_spans = datagrid_table.find_all('span', class_=lambda x: x and 'dg--header-text' in x)
-            headers = [span.get_text(strip=True) for span in header_spans if span.get_text(strip=True)]
-        
-        if not headers:
-            return table_data
-        
-        # Buscar todas las filas de datos
-        # Las celdas tienen role="cell" y contienen spans con class="dg--default-cell"
-        rows = datagrid_table.find_all('div', {'role': 'row'})
-        
-        for row in rows:
-            # Saltar la fila de encabezado
-            if row.find('div', {'role': 'columnheader'}):
-                continue
-            
-            cells = row.find_all('div', {'role': 'cell'})
-            if not cells:
-                continue
-            
-            row_data = {}
-            for cell in cells:
-                # Saltar las celdas de número de fila (tienen clase dg--row-number-cell)
-                if 'dg--row-number-cell' in ' '.join(cell.get('class', [])):
-                    continue
-                
-                # Buscar el valor en el span con class="dg--default-cell"
-                value_span = cell.find('span', class_=lambda x: x and 'dg--default-cell' in x)
-                if value_span:
-                    value = value_span.get_text(strip=True)
-                    
-                    # Mapear la celda a la columna correcta usando data-cell-id
-                    cell_id = cell.get('data-cell-id', '')
-                    if cell_id:
-                        # El formato es "0_account", "0_Avg Sales", etc.
-                        parts = cell_id.split('_', 1)
-                        if len(parts) == 2:
-                            col_name = parts[1]
-                            # Solo incluir si la columna está en los headers
-                            if col_name in headers:
-                                row_data[col_name] = value
-            
-            # Solo agregar la fila si tiene datos
-            if row_data and len(row_data) > 0:
-                table_data.append(row_data)
-        
-    except Exception as e:
-        print(f"    [WARN] Error al extraer datos de tabla: {e}")
-    
-    return table_data
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 
-def extract_titles_from_html(html_file_path):
-    """
-    Extrae todos los títulos (texto dentro de divs con class="ansiout")
-    que se encuentran dentro de divs con data-testid="CommandResult"
-    y también extrae las tablas de datos del div hermano siguiente.
-    Retorna una lista de diccionarios con 'title' y 'table_data'.
-    """
-    
-    try:
-        print(f"Leyendo archivo: {html_file_path}")
-        
-        # Leer el archivo HTML
-        with open(html_file_path, 'r', encoding='utf-8') as f:
-            html_content = f.read()
-        
-        # Parsear el HTML con BeautifulSoup
-        soup = BeautifulSoup(html_content, 'html.parser')
-        print("[OK] Archivo HTML parseado correctamente")
-        
-        # Buscar todos los divs con data-testid="CommandResult" en todo el documento
-        command_results = soup.find_all('div', {'data-testid': 'CommandResult'})
-        
-        print(f"[OK] Se encontraron {len(command_results)} elementos CommandResult")
-        
-        # Lista para almacenar los resultados (título + tabla)
-        results = []
-        
-        # Iterar sobre cada CommandResult
-        for idx, command_result in enumerate(command_results, 1):
-            try:
-                found_title = False
-                title_text = None
-                
-                # ESTRATEGIA 1: Buscar div con data-testid="ansi-output" y luego div con class="ansiout"
-                ansi_output_divs = command_result.find_all('div', {'data-testid': 'ansi-output'})
-                
-                if ansi_output_divs:
-                    for ansi_output in ansi_output_divs:
-                        ansiout_divs = ansi_output.find_all('div', class_=lambda x: x and 'ansiout' in x)
-                        for ansiout_div in ansiout_divs:
-                            text = ansiout_div.get_text(strip=True)
-                            if text:
-                                title_text = text
-                                found_title = True
-                                print(f"\n[{idx}] [OK] Título encontrado:")
-                                print(f"    {text}")
-                                break
-                        if found_title:
-                            break
-                
-                # ESTRATEGIA 2: Buscar directamente div con class que contenga "ansiout"
-                if not found_title:
-                    ansiout_divs = command_result.find_all('div', class_=lambda x: x and 'ansiout' in x)
-                    for ansiout_div in ansiout_divs:
-                        text = ansiout_div.get_text(strip=True)
-                        if text:
-                            title_text = text
-                            found_title = True
-                            print(f"\n[{idx}] [OK] Título encontrado (método 2):")
-                            print(f"    {text}")
-                            break
-                
-                # ESTRATEGIA 3: Buscar por texto que contenga "User Selects"
-                if not found_title:
-                    all_divs = command_result.find_all('div', string=lambda text: text and 'User Selects' in text)
-                    for div in all_divs:
-                        text = div.get_text(strip=True)
-                        if text:
-                            title_text = text
-                            found_title = True
-                            print(f"\n[{idx}] [OK] Título encontrado (método 3):")
-                            print(f"    {text}")
-                            break
-                
-                # Si encontramos un título, buscar el div hermano siguiente con la tabla
-                if found_title and title_text:
-                    table_data = []
-                    
-                    # Buscar el siguiente div hermano con data-testid="CommandResult" y la clase específica
-                    next_sibling = command_result.find_next_sibling('div', {'data-testid': 'CommandResult'})
-                    
-                    if next_sibling:
-                        # Verificar si tiene la clase "command-result-tabs"
-                        classes = next_sibling.get('class', [])
-                        if 'command-result-tabs' in ' '.join(classes):
-                            print(f"    [OK] Div con tabla encontrado, extrayendo datos...")
-                            table_data = extract_table_data(next_sibling)
-                            if table_data:
-                                print(f"    [OK] {len(table_data)} filas extraídas de la tabla")
-                            else:
-                                print(f"    [WARN] No se encontraron datos en la tabla")
-                    
-                    # Agregar el resultado (título + tabla)
-                    results.append({
-                        'title': title_text,
-                        'table_data': table_data
-                    })
-                
-                # Si no se encontró nada, mostrar información de debug solo para los primeros 3
-                if not found_title and idx <= 3:
-                    print(f"\n[{idx}] [WARN] No se encontró título. Debug:")
-                    try:
-                        # Verificar estructura
-                        ansi_output_count = len(command_result.find_all('div', {'data-testid': 'ansi-output'}))
-                        ansiout_count = len(command_result.find_all('div', class_='ansiout'))
-                        all_divs_count = len(command_result.find_all('div'))
-                        print(f"    - Contenedores ansi-output: {ansi_output_count}")
-                        print(f"    - Divs con class ansiout: {ansiout_count}")
-                        print(f"    - Total de divs: {all_divs_count}")
-                        
-                        # Mostrar algunas clases de divs para debug
-                        sample_divs = command_result.find_all('div')[:5]
-                        print(f"    - Primeras 5 clases de divs encontradas:")
-                        for i, div in enumerate(sample_divs, 1):
-                            div_class = div.get('class', '(sin clase)')
-                            div_text = div.get_text(strip=True)[:30] if div.get_text(strip=True) else '(vacío)'
-                            print(f"      {i}. class='{div_class}' | text='{div_text}...'")
-                    except Exception as e:
-                        print(f"    Error en debug: {e}")
-                        
-            except Exception as e:
-                print(f"\n[{idx}] [ERROR] Error al procesar CommandResult: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-        
-        print(f"\n{'='*60}")
-        print(f"Total de títulos encontrados: {len(results)}")
-        print(f"{'='*60}\n")
-        
-        return results
-        
-    except FileNotFoundError:
-        print(f"Error: No se encontró el archivo {html_file_path}")
-        return []
-    except Exception as e:
-        print(f"Error durante la ejecución: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-def save_titles_to_excel(results, output_file="títulos.xlsx"):
+
+# ----------------------------
+# Utils
+# ----------------------------
+
+def parse_number(value: str):
+    """Convierte strings numéricos comunes a int/float cuando aplica."""
+    if not isinstance(value, str):
+        return value
+    v = value.strip()
+    if not v:
+        return v
+
+    if re.fullmatch(r"-?\d{1,3}(,\d{3})+(\.\d+)?", v):
+        v2 = v.replace(",", "")
+        return float(v2) if "." in v2 else int(v2)
+
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        return float(v)
+
+    return value
+
+
+def is_title_text(txt: str) -> bool:
+    return bool(txt and "User Selects" in txt)
+
+
+def get_title_from_command_result(cr_element) -> Optional[str]:
     """
-    Guarda los títulos y sus tablas asociadas en un archivo Excel.
-    Cada título va seguido de su tabla de datos con las columnas: account, Avg Sales, Number of IDs
+    Extrae el texto del título desde un WebElement (CommandResult).
+    Busca:
+      - div[data-testid="ansi-output"] div.ansiout
+      - cualquier elemento con class que contenga 'ansiout'
+      - texto que contenga "User Selects"
     """
     try:
-        # Crear un nuevo workbook
-        wb = Workbook()
-        
-        # Seleccionar la hoja activa (primera hoja)
-        ws = wb.active
-        ws.title = "Títulos"
-        
-        current_row = 1
-        
-        for result in results:
-            title = result['title']
-            table_data = result['table_data']
-            
-            # Escribir el título en negrita
-            ws[f'A{current_row}'] = title
-            ws[f'A{current_row}'].font = ws[f'A{current_row}'].font.copy(bold=True)
-            current_row += 1
-            
-            # Si hay datos de tabla, escribir la tabla
-            if table_data:
-                # Obtener las columnas de la primera fila
-                columns = list(table_data[0].keys())
-                
-                # Escribir encabezados de la tabla
-                for col_idx, col_name in enumerate(columns, start=1):
-                    cell = ws.cell(row=current_row, column=col_idx)
-                    cell.value = col_name
-                    cell.font = cell.font.copy(bold=True)
-                current_row += 1
-                
-                # Escribir los datos de la tabla
-                for row_data in table_data:
-                    for col_idx, col_name in enumerate(columns, start=1):
-                        value = row_data.get(col_name, '')
-                        # Intentar convertir a número si es posible
-                        try:
-                            # Si parece un número, convertir a int o float
-                            if isinstance(value, str) and value.replace(',', '').replace('.', '').isdigit():
-                                value = float(value.replace(',', ''))
-                        except:
-                            pass
-                        ws.cell(row=current_row, column=col_idx).value = value
-                    current_row += 1
-            
-            # Agregar una fila en blanco entre títulos
-            current_row += 1
-        
-        # Ajustar anchos de columnas
-        ws.column_dimensions['A'].width = 50
-        # Buscar todas las columnas usadas para ajustar sus anchos
-        max_col = 1
-        for result in results:
-            if result['table_data']:
-                max_col = max(max_col, len(result['table_data'][0].keys()))
-        
-        # Ajustar anchos de las columnas de datos (B en adelante)
-        from openpyxl.utils import get_column_letter
-        for col_idx in range(2, max_col + 2):
-            col_letter = get_column_letter(col_idx)
-            ws.column_dimensions[col_letter].width = 20
-        
-        # Guardar el archivo
-        wb.save(output_file)
-        print(f"[OK] Archivo Excel creado exitosamente: {output_file}")
-        print(f"Total de títulos guardados: {len(results)}")
-        return True
-        
-    except Exception as e:
-        print(f"[ERROR] Error al crear el archivo Excel: {e}")
-        import traceback
-        traceback.print_exc()
+        # 1) ansi-output -> ansiout
+        ansi_outputs = cr_element.find_elements(By.CSS_SELECTOR, 'div[data-testid="ansi-output"]')
+        for ao in ansi_outputs:
+            ansiouts = ao.find_elements(By.CSS_SELECTOR, 'div.ansiout')
+            for a in ansiouts:
+                txt = (a.text or "").strip()
+                if is_title_text(txt):
+                    return txt
+                if txt:  # a veces el título no contiene exactamente "User Selects" pero igual te sirve
+                    # si quieres forzar solo User Selects, comenta esta línea:
+                    if "User Selects" in txt:
+                        return txt
+
+        # 2) cualquier div.ansiout directo
+        ansiouts = cr_element.find_elements(By.CSS_SELECTOR, 'div.ansiout')
+        for a in ansiouts:
+            txt = (a.text or "").strip()
+            if is_title_text(txt):
+                return txt
+            if txt and "User Selects" in txt:
+                return txt
+
+        # 3) fallback: buscar cualquier nodo con texto que contenga User Selects
+        # (Selenium no tiene "contains text" fácil sin XPath)
+        nodes = cr_element.find_elements(By.XPATH, ".//*[contains(normalize-space(text()), 'User Selects')]")
+        for n in nodes:
+            txt = (n.text or "").strip()
+            if is_title_text(txt):
+                return txt
+
+    except Exception:
+        pass
+
+    return None
+
+
+def has_table_structure(cr_element) -> bool:
+    """
+    Detecta si el CommandResult parece contener una tabla.
+    - class contiene 'command-result-tabs' OR
+    - existe div[data-testid="datagrid.table"]
+    """
+    try:
+        classes = (cr_element.get_attribute("class") or "")
+        if "command-result-tabs" in classes:
+            return True
+        tables = cr_element.find_elements(By.CSS_SELECTOR, 'div[data-testid="datagrid.table"]')
+        return len(tables) > 0
+    except Exception:
         return False
 
+
+def wait_table_rendered(wait: WebDriverWait, cr_element, timeout_sec: int = 6) -> bool:
+    """
+    Espera a que dentro del CommandResult exista:
+      - datagrid.table
+      - datagrid.grid.right
+      - al menos 1 header
+    """
+    end = time.time() + timeout_sec
+    while time.time() < end:
+        try:
+            datagrid = cr_element.find_elements(By.CSS_SELECTOR, 'div[data-testid="datagrid.table"]')
+            if not datagrid:
+                time.sleep(0.2)
+                continue
+
+            grid_right = cr_element.find_elements(By.CSS_SELECTOR, 'div[data-testid="datagrid.grid.right"]')
+            if not grid_right:
+                time.sleep(0.2)
+                continue
+
+            headers = cr_element.find_elements(By.CSS_SELECTOR, 'div[data-testid="datagrid.grid.right"] div[role="columnheader"]')
+            if headers:
+                return True
+        except Exception:
+            pass
+
+        time.sleep(0.2)
+
+    return False
+
+
+def extract_table_data_from_element(cr_element) -> List[Dict[str, str]]:
+    """
+    Extrae tabla DIRECTAMENTE desde Selenium WebElement.
+    Requisito: el bloque de tabla debe estar visible/renderizado.
+    """
+    table_data: List[Dict[str, str]] = []
+
+    # datagrid + grid right
+    datagrid = cr_element.find_element(By.CSS_SELECTOR, 'div[data-testid="datagrid.table"]')
+    grid_right = datagrid.find_element(By.CSS_SELECTOR, 'div[data-testid="datagrid.grid.right"]')
+
+    # headers
+    headers = []
+    header_elements = grid_right.find_elements(By.CSS_SELECTOR, 'div[role="columnheader"]')
+    for h in header_elements:
+        txt = (h.text or "").strip()
+        if txt and txt != "#row_number#":
+            headers.append(txt)
+
+    if not headers:
+        return table_data
+
+    # rows (solo lo visible; en estos HTML exportados normalmente basta)
+    row_elements = grid_right.find_elements(By.CSS_SELECTOR, 'div[role="row"]')
+    for row in row_elements:
+        # saltar header-row
+        if row.find_elements(By.CSS_SELECTOR, 'div[role="columnheader"]'):
+            continue
+
+        cells = row.find_elements(By.CSS_SELECTOR, 'div[role="cell"]')
+        if not cells:
+            continue
+
+        row_data = {}
+        for cell in cells:
+            cell_id = (cell.get_attribute("data-cell-id") or "").strip()
+            value = (cell.text or "").strip()
+            if not value:
+                continue
+
+            # cell_id suele ser "13_account", "13_Avg Sales", etc
+            col_name = None
+            if "_" in cell_id:
+                _, col_name = cell_id.split("_", 1)
+            else:
+                # fallback por posición
+                col_name = None
+
+            if col_name and col_name in headers:
+                row_data[col_name] = value
+            elif col_name is None:
+                # fallback por índice (último recurso)
+                idx = cells.index(cell)
+                if idx < len(headers):
+                    row_data[headers[idx]] = value
+
+        if row_data:
+            table_data.append(row_data)
+
+    return table_data
+
+
+# ----------------------------
+# Main extraction
+# ----------------------------
+
+def extract_titles_and_tables_live(driver, max_lookahead: int = 40) -> List[Dict]:
+    wait = WebDriverWait(driver, 12)
+
+    # obtener todos los CommandResult
+    command_results = driver.find_elements(By.CSS_SELECTOR, 'div[data-testid="CommandResult"]')
+    print(f"[INFO] CommandResult blocks: {len(command_results)}")
+
+    results = []
+
+    for idx, cr in enumerate(command_results, start=1):
+        title = get_title_from_command_result(cr)
+        if not title:
+            continue
+
+        print(f"\n[{idx}] TITLE: {title}")
+
+        # buscar el siguiente CommandResult que tenga estructura de tabla
+        table_data = []
+        found_table_block = None
+
+        for j in range(1, max_lookahead + 1):
+            if idx - 1 + j >= len(command_results):
+                break
+            cand = command_results[idx - 1 + j]
+
+            # si aparece otro título antes de tabla, cortamos
+            cand_title = get_title_from_command_result(cand)
+            if cand_title and cand_title != title:
+                print(f"    [STOP] Next title reached before table (lookahead #{j}).")
+                break
+
+            if has_table_structure(cand):
+                found_table_block = cand
+                print(f"    [OK] Table structure found at lookahead #{j}.")
+                break
+
+        if found_table_block is not None:
+            # scrollear y esperar renderizado
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", found_table_block)
+            time.sleep(0.6)
+
+            rendered = wait_table_rendered(wait, found_table_block, timeout_sec=8)
+            if not rendered:
+                print("    [WARN] Table did not render (virtualized / not loaded).")
+            else:
+                try:
+                    table_data = extract_table_data_from_element(found_table_block)
+                    print(f"    [OK] Rows extracted: {len(table_data)}")
+                except Exception as e:
+                    print(f"    [ERROR] Extract table failed: {e}")
+
+        results.append({"title": title, "table_data": table_data})
+
+    return results
+
+
+# ----------------------------
+# Excel
+# ----------------------------
+
+def save_to_excel(results: List[Dict], output_file: str):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Results"
+
+    row = 1
+
+    for item in results:
+        title = item["title"]
+        table = item["table_data"]
+
+        ws.cell(row=row, column=1, value=title).font = Font(bold=True)
+        row += 1
+
+        if table:
+            # columnas: unión ordenada
+            columns = []
+            seen = set()
+            for r in table:
+                for k in r.keys():
+                    if k not in seen:
+                        seen.add(k)
+                        columns.append(k)
+
+            # headers
+            for col_idx, col_name in enumerate(columns, start=1):
+                cell = ws.cell(row=row, column=col_idx, value=col_name)
+                cell.font = Font(bold=True)
+            row += 1
+
+            # data
+            for r in table:
+                for col_idx, col_name in enumerate(columns, start=1):
+                    v = r.get(col_name, "")
+                    ws.cell(row=row, column=col_idx, value=parse_number(v))
+                row += 1
+
+        row += 1  # blank line
+
+    # widths
+    for col_idx in range(1, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = 24 if col_idx > 1 else 80
+
+    wb.save(output_file)
+    print(f"[OK] Excel saved: {output_file}")
+
+
+# ----------------------------
+# Selenium bootstrap
+# ----------------------------
+
+def create_driver():
+    chrome_options = Options()
+    # chrome_options.add_argument("--headless=new")  # si quieres headless
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--start-maximized")
+
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
+    except Exception:
+        # fallback webdriver-manager
+        from webdriver_manager.chrome import ChromeDriverManager
+        from selenium.webdriver.chrome.service import Service
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        return driver
+
+
+def open_local_html(driver, html_file_path: str):
+    abs_path = os.path.abspath(html_file_path)
+    file_url = f"file:///{abs_path.replace(os.sep, '/')}"
+    driver.get(file_url)
+
+    wait = WebDriverWait(driver, 15)
+    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+    time.sleep(1.5)
+    driver.execute_script("window.scrollTo(0, 0);")
+    time.sleep(0.5)
+
+
+# ----------------------------
+# Entrypoint
+# ----------------------------
+
 if __name__ == "__main__":
-    # Lista de archivos HTML a probar en orden de prioridad
-    html_files = [
-        "body.html",
-        "Dimension Scenarios.html",
-        "Dimension Scenarios v3.html"
-    ]
+    parser = argparse.ArgumentParser(
+        description="Extrae títulos y tablas de archivos HTML de Databricks y los exporta a Excel"
+    )
+    parser.add_argument(
+        "html_file",
+        type=str,
+        help="Ruta al archivo HTML a procesar"
+    )
     
-    html_file = None
-    for file in html_files:
-        if os.path.exists(file):
-            html_file = file
-            break
+    args = parser.parse_args()
+    html_file = args.html_file
     
-    if not html_file:
-        print(f"Error: No se encontró ningún archivo HTML.")
-        print("Archivos buscados:")
-        for file in html_files:
-            print(f"  - {file}")
-        print("Por favor, asegúrate de que al menos uno de estos archivos existe en el directorio actual.")
-        exit(1)
+    # Validar que el archivo existe
+    if not os.path.exists(html_file):
+        print(f"❌ Error: El archivo no existe: {html_file}")
+        sys.exit(1)
     
-    print(f"Procesando archivo: {html_file}")
-    print("=" * 60)
+    # Validar que es un archivo HTML
+    if not html_file.lower().endswith(('.html', '.htm')):
+        print(f"❌ Advertencia: El archivo no parece ser HTML: {html_file}")
     
-    # Extraer los títulos y tablas
-    results = extract_titles_from_html(html_file)
-    
-    # Guardar los títulos y tablas en un archivo Excel
-    if results:
-        # Generar nombre de archivo con timestamp para evitar sobrescribir
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        excel_filename = f"títulos_{timestamp}.xlsx"
-        save_titles_to_excel(results, excel_filename)
-    else:
-        print("\n[INFO] No se encontraron títulos para guardar en Excel.")
+    print(f"[INFO] Procesando archivo: {html_file}")
+
+    driver = create_driver()
+    try:
+        open_local_html(driver, html_file)
+
+        # IMPORTANTE: NO hacemos scroll global para “renderizar todo”.
+        # Extraemos tabla por tabla cuando toca.
+        results = extract_titles_and_tables_live(driver, max_lookahead=40)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = f"titulos_{ts}.xlsx"
+        save_to_excel(results, out)
+
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
